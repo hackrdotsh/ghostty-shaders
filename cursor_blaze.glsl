@@ -3,25 +3,14 @@ float ease(float x) {
     return pow(1.0 - x, 10.0);
 }
 
-float sdBox(in vec2 p, in vec2 xy, in vec2 b)
-{
-    vec2 d = abs(p - xy) - b;
-    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
-}
-
-float getSdfRectangle(in vec2 p, in vec2 xy, in vec2 b)
-{
-    vec2 d = abs(p - xy) - b;
-    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
-}
 // Based on Inigo Quilez's 2D distance functions article: https://iquilezles.org/articles/distfunctions2d/
 // Potencially optimized by eliminating conditionals and loops to enhance performance and reduce branching
 float seg(in vec2 p, in vec2 a, in vec2 b, inout float s, float d) {
     vec2 e = b - a;
     vec2 w = p - a;
-    vec2 proj = a + e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
-    float segd = dot(p - proj, p - proj);
-    d = min(d, segd);
+    // pq = p - proj with proj = a + e*t; writing w - e*t saves one vector add (IQ's original form).
+    vec2 pq = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
+    d = min(d, dot(pq, pq));
 
     float c0 = step(0.0, p.y - a.y);
     float c1 = 1.0 - step(0.0, p.y - b.y);
@@ -45,7 +34,8 @@ float getSdfParallelogram(in vec2 p, in vec2 v0, in vec2 v1, in vec2 v2, in vec2
     return s * sqrt(d);
 }
 
-vec2 normalize(vec2 value, float isPosition) {
+// Named norm, not normalize, so it doesn't shadow the GLSL built-in normalize (as in cursor_smear_rocket.glsl).
+vec2 norm(vec2 value, float isPosition) {
     return (value * 2.0 - (iResolution.xy * isPosition)) / iResolution.y;
 }
 
@@ -53,10 +43,6 @@ float blend(float t)
 {
     float sqr = t * t;
     return sqr / (2.0 * (sqr - t) + 1.0);
-}
-
-float antialising(float distance) {
-    return 1. - smoothstep(0., normalize(vec2(2., 2.), 0.).x, distance);
 }
 
 float determineStartVertexFactor(vec2 a, vec2 b) {
@@ -72,71 +58,118 @@ vec2 getRectangleCenter(vec4 rectangle) {
 }
 
 const vec4 TRAIL_COLOR = vec4(1.0, 0.725, 0.161, 1.0); // yellow
-const vec4 CURRENT_CURSOR_COLOR = TRAIL_COLOR;
-const vec4 PREVIOUS_CURSOR_COLOR = TRAIL_COLOR;
 const vec4 TRAIL_COLOR_ACCENT = vec4(1.0, 0., 0., 1.0); // red-orange
 const float DURATION = .5;
-const float OPACITY = .2;
 // Don't draw trail within that distance * cursor size.
 // This prevents trails from appearing when typing.
 const float DRAW_THRESHOLD = 1.5;
 // Don't draw trails within the same line: same line jumps are usually where
 // people expect them.
 const bool HIDE_TRAILS_ON_THE_SAME_LINE = false;
+// Trail taper: width at the tail (previous cursor position) relative to the current cursor;
+// 0.0 = tapers to a point, 1.0 = constant width. Mimics the rocket trail shape.
+const float TAPER_FACTOR = 0.1;
+// The red-orange halo 1 - smoothstep(sdf, -0.01, 0.001) weighs < 0.5/255 once sdf exceeds this (normalized units);
+// used as the corridor-cull margin. Recompute it if the smoothstep constants below change.
+const float GLOW_REACH = 0.42;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
-    #if !defined(WEB)
-    fragColor = texture(iChannel0, fragCoord.xy / iResolution.xy);
-    #endif
-    //Normalization for fragCoord to a space of -1 to 1;
-    vec2 vu = normalize(fragCoord, 1.);
-    vec2 offsetFactor = vec2(-.5, 0.5);
+    // Cache UV and sample the previous frame once to avoid repeated reads.
+    vec2 uv = fragCoord.xy / iResolution.xy;
+    fragColor = texture(iChannel0, uv);
+
+    // Early exit 1: no trail when the window is unfocused or the cursor is hidden (as in cursor_balatro.glsl).
+    // This also stops trails from cursor jumps while hidden (TUI redraws).
+    if (iFocus == 0 || iCursorVisible == 0) {
+        return;
+    }
+
+    // Early exit 2: nothing to draw once the animation is over. Compare raw time first: idle frames stop here, skipping blend/pow.
+    // blend(t) < 1 for t < 1; if easedProgress underflows to 0 the trail is invisible, and this avoids divide-by-zero/NaN below.
+    float t = (iTime - iTimeCursorChange) / DURATION;
+    if (t >= 1.0) {
+        return;
+    }
+    float easedProgress = ease(blend(max(t, 0.0)));
+    if (easedProgress <= 0.0) {
+        return;
+    }
 
     //Normalization for cursor position and size;
     //cursor xy has the postion in a space of -1 to 1;
     //zw has the width and height
-    vec4 currentCursor = vec4(normalize(iCurrentCursor.xy, 1.), normalize(iCurrentCursor.zw, 0.));
-    vec4 previousCursor = vec4(normalize(iPreviousCursor.xy, 1.), normalize(iPreviousCursor.zw, 0.));
+    vec4 currentCursor = vec4(norm(iCurrentCursor.xy, 1.), norm(iCurrentCursor.zw, 0.));
+    vec4 previousCursor = vec4(norm(iPreviousCursor.xy, 1.), norm(iPreviousCursor.zw, 0.));
+
+    // Early exit 3: no trail for tiny moves (typing). Compare squared distance first to avoid an expensive sqrt.
+    vec2 centerCC = getRectangleCenter(currentCursor);
+    vec2 centerCP = getRectangleCenter(previousCursor);
+    vec2 delta = centerCC - centerCP;
+    float lineLengthSq = dot(delta, delta);
+
+    float cursorSize = max(currentCursor.z, currentCursor.w);
+    float trailThreshold = DRAW_THRESHOLD * cursorSize;
+    bool isOnSeparateLine = HIDE_TRAILS_ON_THE_SAME_LINE ? currentCursor.y != previousCursor.y : true;
+    if (lineLengthSq <= trailThreshold * trailThreshold || !isOnSeparateLine) {
+        return;
+    }
+
+    // Only compute sqrt when it is actually needed.
+    float lineLength = sqrt(lineLengthSq);
+
+    //Normalization for fragCoord to a space of -1 to 1;
+    vec2 vu = norm(fragCoord, 1.);
+
+    // Early exit 4: pixels beyond the current animation radius get no trail contribution, so skip the SDF.
+    // Squared compare; sqrt and division are left for pixels that pass every cull.
+    vec2 toEnd = vu - centerCC;
+    float distSq = dot(toEnd, toEnd);
+    float radius = lineLength * easedProgress;
+    if (distSq >= radius * radius) {
+        return;
+    }
+
+    // Early exit 5: corridor cull (cursor_balatro.glsl Stage 2). All quad vertices lie within reach of the two
+    // cursor centers; padded by GLOW_REACH, so pixels outside the capsule are unchanged.
+    vec2 fromPrev = vu - centerCP;
+    vec2 off = fromPrev - delta * clamp(dot(fromPrev, delta) / lineLengthSq, 0.0, 1.0);
+    float reach = (0.5 + TAPER_FACTOR) * length(max(currentCursor.zw, previousCursor.zw)) + GLOW_REACH;
+    if (dot(off, off) > reach * reach) {
+        return;
+    }
+
+    // Early exit 6: keep the cursor cell as-is (equivalent to the old step(sdfCursor, 0.0)), checked before any SDF.
+    if (all(lessThanEqual(abs(toEnd), currentCursor.zw * 0.5))) {
+        return;
+    }
+
+    float alphaModifier = sqrt(distSq) / radius;
+
+    // Anti-aliasing edge width: equals norm(vec2(2.,2.),0.).x = 2.*2./iResolution.y,
+    // computed once instead of per pixel inside smoothstep.
+    float aaWidth = 4.0 / iResolution.y;
 
     //When drawing a parellelogram between cursors for the trail i need to determine where to start at the top-left or top-right vertex of the cursor
     float vertexFactor = determineStartVertexFactor(currentCursor.xy, previousCursor.xy);
     float invertedVertexFactor = 1.0 - vertexFactor;
 
+    //Tapered trail: full width at the current cursor, narrowed by TAPER_FACTOR at the previous one,
+    //giving a wide-head, narrow-tail rocket trail (as in cursor_smear_rocket.glsl).
+    vec2 currentWidth = currentCursor.zw;
+    vec2 previousWidth = currentCursor.zw * TAPER_FACTOR;
+
     //Set every vertex of my parellogram
-    vec2 v0 = vec2(currentCursor.x + currentCursor.z * vertexFactor, currentCursor.y - currentCursor.w);
-    vec2 v1 = vec2(currentCursor.x + currentCursor.z * invertedVertexFactor, currentCursor.y);
-    vec2 v2 = vec2(previousCursor.x + currentCursor.z * invertedVertexFactor, previousCursor.y);
-    vec2 v3 = vec2(previousCursor.x + currentCursor.z * vertexFactor, previousCursor.y - previousCursor.w);
+    //v0, v1 = current cursor (full width); v2, v3 = previous cursor (narrowed)
+    vec2 v0 = vec2(currentCursor.x + currentWidth.x * vertexFactor, currentCursor.y - currentWidth.y);
+    vec2 v1 = vec2(currentCursor.x + currentWidth.x * invertedVertexFactor, currentCursor.y);
+    vec2 v2 = vec2(previousCursor.x + previousWidth.x * invertedVertexFactor, previousCursor.y);
+    vec2 v3 = vec2(previousCursor.x + previousWidth.x * vertexFactor, previousCursor.y - previousWidth.y);
 
-    vec4 newColor = vec4(fragColor);
+    float sdfTrail = getSdfParallelogram(vu, v0, v1, v2, v3);
 
-    float progress = blend(clamp((iTime - iTimeCursorChange) / DURATION, 0.0, 1));
-    float easedProgress = ease(progress);
-
-    //Distance between cursors determine the total length of the parallelogram;
-    vec2 centerCC = getRectangleCenter(currentCursor);
-    vec2 centerCP = getRectangleCenter(previousCursor);
-    float cursorSize = max(currentCursor.z, currentCursor.w);
-    float trailThreshold = DRAW_THRESHOLD * cursorSize;
-    float lineLength = distance(centerCC, centerCP);
-    //
-    bool isFarEnough = lineLength > trailThreshold;
-    bool isOnSeparateLine = HIDE_TRAILS_ON_THE_SAME_LINE ? currentCursor.y != previousCursor.y : true;
-    if (isFarEnough && isOnSeparateLine) {
-        float distanceToEnd = distance(vu.xy, centerCC);
-        float alphaModifier = distanceToEnd / (lineLength * (easedProgress));
-
-        if (alphaModifier > 1.0) { // this change fixed it for me.
-            alphaModifier = 1.0;
-        }
-
-        float sdfCursor = getSdfRectangle(vu, currentCursor.xy - (currentCursor.zw * offsetFactor), currentCursor.zw * 0.5);
-        float sdfTrail = getSdfParallelogram(vu, v0, v1, v2, v3);
-
-        newColor = mix(newColor, TRAIL_COLOR_ACCENT, 1.0 - smoothstep(sdfTrail, -0.01, 0.001));
-        newColor = mix(newColor, TRAIL_COLOR, antialising(sdfTrail));
-        newColor = mix(fragColor, newColor, 1.0 - alphaModifier);
-        fragColor = mix(newColor, fragColor, step(sdfCursor, 0));
-    }
+    vec4 newColor = fragColor;
+    newColor = mix(newColor, TRAIL_COLOR_ACCENT, 1.0 - smoothstep(sdfTrail, -0.01, 0.001));
+    newColor = mix(newColor, TRAIL_COLOR, 1.0 - smoothstep(0.0, aaWidth, sdfTrail));
+    fragColor = mix(fragColor, newColor, 1.0 - alphaModifier);
 }
