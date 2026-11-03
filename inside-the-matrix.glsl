@@ -66,7 +66,8 @@ vec4 hash4(vec3 v)
 float rune_line(vec2 p, vec2 a, vec2 b) {   // from https://www.shadertoy.com/view/4dcfW8
     p -= a, b -= a;
     float h = clamp(dot(p, b) / dot(b, b), 0., 1.);   // proj coord on line
-    return length(p - b * h);                         // dist to segment
+    p -= b * h;
+    return dot(p, p);                                 // squared dist to segment, rune() takes one sqrt
 }
 
 float rune(vec2 U, vec2 seed, float highlight)
@@ -89,6 +90,7 @@ float rune(vec2 U, vec2 seed, float highlight)
             if (pos.xy != pos.zw)  //filter out single points (when start and end are the same)
                 d = min(d, rune_line(U, pos.xy, pos.zw + .001) ); // closest line
 	}
+	d = sqrt(d);
 	return smoothstep(0.1, 0., d) + highlight*smoothstep(0.4, 0., d);
 }
 
@@ -153,6 +155,8 @@ vec3 rain(vec3 ro3, vec3 rd3, float time) {
         float char_z_shift = floor(z_shift / STRIP_CHAR_HEIGHT);
         z_shift = char_z_shift * STRIP_CHAR_HEIGHT;
         int zcell = int(floor((pos_z - z_shift)/ZCELL_SIZE));  //z-cell index
+        //drops lie inside their own z-cell, so if the segment ends in the same z-cell the next one can't be hit
+        int zcell_end = int(floor((ro3.z + rd3.z * t2 / t3_to_t2 - z_shift)/ZCELL_SIZE));
         for (int j=0; j<2; j++) {  //2 iterations is enough if camera doesn't look much up or down
             //  calcaulate coordinates of the target (raindrop)
             vec4 cell_hash = hash4(vec3(ivec3(cell, zcell)));
@@ -197,6 +201,7 @@ vec3 rain(vec3 ro3, vec3 rd3, float time) {
                 }
             }
             // not found in this cell - go to next vertical cell
+            if (zcell == zcell_end) break;
             zcell += cell_shift.z;
         }
         // go to next horizontal cell
